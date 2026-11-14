@@ -45,6 +45,7 @@ use std::pin::Pin;
 
 mod exec;
 mod quad_gl;
+pub use quad_gl::{BatchMark, BatchSave, SubmitStats};
 mod tobytes;
 
 pub mod audio;

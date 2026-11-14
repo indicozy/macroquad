@@ -19,6 +19,7 @@ pub enum DrawMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlPipeline(usize);
 
+#[derive(Clone)]
 struct DrawCall {
     vertices_count: usize,
     indices_count: usize,
@@ -574,6 +575,41 @@ pub struct QuadGl {
     batch_index_buffer: Vec<u16>,
     /// Scratch for the vertices of a geometry call under a CPU model transform.
     cpu_transformed_vertices: Vec<Vertex>,
+    /// Razdor's lab counters (see [`SubmitStats`]): the submissions since the last take.
+    submit: SubmitStats,
+    /// Batch submissions made so far (every `draw`): a [`BatchMark`] from before one is stale.
+    flushes: u64,
+}
+
+/// What the batch submissions cost since the last [`QuadGl::take_submit_stats`]: the draw calls issued, the
+/// bytes uploaded (vertices and indices) and the seconds spent in `draw` (the submission, GL calls included).
+/// Razdor's lab profile reads these (`frame_probe`); they are counted whether or not anyone reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SubmitStats {
+    pub draws: u64,
+    pub bytes: u64,
+    pub seconds: f64,
+}
+
+/// The batch's end at a point of a frame (see [`QuadGl::batch_mark`]).
+#[derive(Clone, Copy, Debug)]
+pub struct BatchMark {
+    draws: usize,
+    verts: usize,
+    indices: usize,
+    flushes: u64,
+}
+
+/// The draw calls of a span of the batch, copied out by [`QuadGl::batch_save`] to be issued again by
+/// [`QuadGl::batch_replay`] (the lab's replay floor). Their state (texture, clip, model, pipeline, pass) travels
+/// with them; their vertices and indices are copies too.
+#[derive(Clone)]
+pub struct BatchSave {
+    draws: Vec<DrawCall>,
+    verts: Vec<Vertex>,
+    indices: Vec<u16>,
+    first_vert: usize,
+    first_index: usize,
 }
 
 impl QuadGl {
@@ -611,6 +647,8 @@ impl QuadGl {
             cpu_transformed_vertices: Vec::new(),
             max_vertices,
             max_indices,
+            submit: SubmitStats::default(),
+            flushes: 0,
         }
     }
 
@@ -687,6 +725,8 @@ impl QuadGl {
     }
 
     pub fn draw(&mut self, ctx: &mut dyn miniquad::RenderingBackend, projection: glam::Mat4) {
+        let started = miniquad::date::now();
+        self.flushes += 1;
         let white_texture = self.white_texture;
 
         for _ in 0..self.draw_calls.len() - self.draw_calls_bindings.len() {
@@ -738,6 +778,8 @@ impl QuadGl {
                 ctx.begin_default_pass(PassAction::Nothing);
             }
 
+            self.submit.draws += 1;
+            self.submit.bytes += (dc.vertices_count * std::mem::size_of::<Vertex>() + dc.indices_count * std::mem::size_of::<u16>()) as u64;
             ctx.buffer_update(
                 bindings.vertex_buffers[0],
                 BufferSource::slice(
@@ -810,6 +852,59 @@ impl QuadGl {
         self.draw_calls_count = 0;
         self.batch_index_buffer.clear();
         self.batch_vertex_buffer.clear();
+        self.submit.seconds += miniquad::date::now() - started;
+    }
+
+    /// The submission counters since the last call, and reset them (see [`SubmitStats`]).
+    pub fn take_submit_stats(&mut self) -> SubmitStats {
+        std::mem::take(&mut self.submit)
+    }
+
+    /// The batch's end now. The next draw opens a new draw call, so the draws after the mark are exactly the
+    /// ones [`QuadGl::batch_save`] copies from it. Only a lab's replay uses it.
+    pub fn batch_mark(&mut self) -> BatchMark {
+        self.state.break_batching = true;
+        BatchMark {
+            draws: self.draw_calls_count,
+            verts: self.batch_vertex_buffer.len(),
+            indices: self.batch_index_buffer.len(),
+            flushes: self.flushes,
+        }
+    }
+
+    /// The draw calls and their vertices made since `from`, copied out; None when the batch was submitted in
+    /// between (a flush makes the mark stale).
+    pub fn batch_save(&self, from: BatchMark) -> Option<BatchSave> {
+        if from.flushes != self.flushes || from.draws > self.draw_calls_count {
+            return None;
+        }
+        Some(BatchSave {
+            draws: self.draw_calls[from.draws..self.draw_calls_count].to_vec(),
+            verts: self.batch_vertex_buffer[from.verts..].to_vec(),
+            indices: self.batch_index_buffer[from.indices..].to_vec(),
+            first_vert: from.verts,
+            first_index: from.indices,
+        })
+    }
+
+    /// Issues the saved draw calls again, after the batch's current end, as if the code had drawn them: the next
+    /// submission draws them with their own state.
+    pub fn batch_replay(&mut self, save: &BatchSave) {
+        let (v0, i0) = (self.batch_vertex_buffer.len(), self.batch_index_buffer.len());
+        self.batch_vertex_buffer.extend_from_slice(&save.verts);
+        self.batch_index_buffer.extend_from_slice(&save.indices);
+        for dc in &save.draws {
+            let mut dc = dc.clone();
+            dc.vertices_start = v0 + (dc.vertices_start - save.first_vert);
+            dc.indices_start = i0 + (dc.indices_start - save.first_index);
+            if self.draw_calls_count < self.draw_calls.len() {
+                self.draw_calls[self.draw_calls_count] = dc;
+            } else {
+                self.draw_calls.push(dc);
+            }
+            self.draw_calls_count += 1;
+        }
+        self.state.break_batching = true;
     }
 
     pub(crate) fn capture(&mut self, capture: bool) {
