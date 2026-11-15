@@ -702,11 +702,22 @@ impl QuadGl {
     }
 
     /// The state the draw call `index` of the batch draws with, or None when no such draw call is open.
-    pub fn draw_state(&self, index: usize) -> Option<DrawState> {
+    pub fn draw_state(&mut self, index: usize) -> Option<DrawState> {
         if index >= self.draw_calls_count {
             return None;
         }
         let dc = &self.draw_calls[index];
+        // The built-in uniforms are written at each submission (`draw`: Projection, Model and _Time, the last two of
+        // this draw call's own and of the frame), so a snapshot's copies of them are not the draw's state: they are
+        // zeroed here, and the draw keeps its own `model` above. The user's uniforms (`TexSize`, ...) are compared as they are.
+        let mut uniforms = dc.uniforms.clone();
+        if let Some(bytes) = uniforms.as_mut() {
+            for u in &self.pipelines.get_quad_pipeline_mut(dc.pipeline).uniforms {
+                if matches!(u.name.as_str(), "Projection" | "Model" | "_Time") {
+                    bytes[u.byte_offset..u.byte_offset + u.byte_size].fill(0);
+                }
+            }
+        }
         Some(DrawState {
             texture: dc.texture,
             clip: dc.clip,
@@ -714,7 +725,7 @@ impl QuadGl {
             model: dc.model,
             draw_mode: dc.draw_mode,
             pipeline: dc.pipeline,
-            uniforms: dc.uniforms.clone(),
+            uniforms,
             render_pass: dc.render_pass,
             capture: dc.capture,
         })
