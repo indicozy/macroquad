@@ -37,6 +37,18 @@ struct DrawCall {
     uniforms: Option<Vec<u8>>,
     render_pass: Option<RenderPass>,
     capture: bool,
+    /// Set for a retained draw call ([`QuadGl::draw_static`]): it draws this range of a [`StaticGeometry`] and
+    /// has no batch vertices of its own.
+    static_src: Option<StaticSource>,
+}
+
+/// The GPU side of a retained draw call: the static geometry's buffers and the index range drawn.
+#[derive(Debug, Clone, Copy)]
+struct StaticSource {
+    vertex_buffer: BufferId,
+    index_buffer: BufferId,
+    first_index: usize,
+    index_count: usize,
 }
 
 impl DrawCall {
@@ -62,6 +74,7 @@ impl DrawCall {
             uniforms,
             render_pass,
             capture: false,
+            static_src: None,
         }
     }
 }
@@ -612,6 +625,161 @@ pub struct BatchSave {
     first_index: usize,
 }
 
+/// The batch's end, read without breaking the batch (see [`QuadGl::batch_position`]). A span between two positions
+/// of one frame is the vertices and indices issued in between ([`QuadGl::batch_span`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchPosition {
+    pub draws: usize,
+    pub verts: usize,
+    pub indices: usize,
+    pub flushes: u64,
+}
+
+/// What a draw call draws with: its texture, clip, viewport, model, pipeline, pass, draw mode, capture flag and
+/// uniforms. Two draw calls with equal states draw with the same settings (see [`QuadGl::draw_state`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawState {
+    texture: Option<miniquad::TextureId>,
+    clip: Option<(i32, i32, i32, i32)>,
+    viewport: Option<(i32, i32, i32, i32)>,
+    model: glam::Mat4,
+    draw_mode: DrawMode,
+    pipeline: GlPipeline,
+    uniforms: Option<Vec<u8>>,
+    render_pass: Option<RenderPass>,
+    capture: bool,
+}
+
+/// Vertices and indices kept on the GPU, drawn in batch order by [`QuadGl::draw_static`]. Its indices are absolute
+/// (into its own vertices), so at most 65536 vertices. Made with [`StaticGeometry::new`] and freed with
+/// [`StaticGeometry::delete`]; a free is not safe while a draw of it may still be submitted (free it a frame later).
+#[derive(Debug)]
+pub struct StaticGeometry {
+    vertex_buffer: BufferId,
+    index_buffer: BufferId,
+    index_count: usize,
+}
+
+impl StaticGeometry {
+    /// Uploads `vertices` and `indices` once. The vertices are used as given: a CPU model transform, if the
+    /// caller wants one, is applied by the caller (see [`QuadGl::cpu_model`]).
+    pub fn new(ctx: &mut dyn miniquad::RenderingBackend, vertices: &[Vertex], indices: &[u16]) -> StaticGeometry {
+        assert!(vertices.len() <= u16::MAX as usize + 1, "StaticGeometry: more vertices than u16 indices reach");
+        assert!(!indices.is_empty(), "StaticGeometry: no indices");
+        let vertex_buffer = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(vertices));
+        let index_buffer = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(indices));
+        StaticGeometry { vertex_buffer, index_buffer, index_count: indices.len() }
+    }
+
+    /// The number of indices (the ranges [`QuadGl::draw_static`] takes are within it).
+    pub fn index_count(&self) -> usize {
+        self.index_count
+    }
+
+    /// Frees the GPU buffers.
+    pub fn delete(self, ctx: &mut dyn miniquad::RenderingBackend) {
+        ctx.delete_buffer(self.vertex_buffer);
+        ctx.delete_buffer(self.index_buffer);
+    }
+}
+
+impl QuadGl {
+    /// The current CPU model transform (see [`QuadGl::push_cpu_model_matrix`]): what the vertices of a geometry call
+    /// are moved by before they are batched. A caller that makes a [`StaticGeometry`] applies the same one itself.
+    pub fn cpu_model(&self) -> glam::Mat4 {
+        self.state.cpu_model()
+    }
+
+    /// Ends the current draw call: the next geometry or static draw opens a new one. Draws are the same
+    /// (the same triangles in the same order); only the number of draw calls changes.
+    pub fn batch_break(&mut self) {
+        self.state.break_batching = true;
+    }
+
+    /// The batch's end now, read only (unlike [`QuadGl::batch_mark`], it does not break the batch).
+    pub fn batch_position(&self) -> BatchPosition {
+        BatchPosition { draws: self.draw_calls_count, verts: self.batch_vertex_buffer.len(), indices: self.batch_index_buffer.len(), flushes: self.flushes }
+    }
+
+    /// The state the draw call `index` of the batch draws with, or None when no such draw call is open.
+    pub fn draw_state(&self, index: usize) -> Option<DrawState> {
+        if index >= self.draw_calls_count {
+            return None;
+        }
+        let dc = &self.draw_calls[index];
+        Some(DrawState {
+            texture: dc.texture,
+            clip: dc.clip,
+            viewport: dc.viewport,
+            model: dc.model,
+            draw_mode: dc.draw_mode,
+            pipeline: dc.pipeline,
+            uniforms: dc.uniforms.clone(),
+            render_pass: dc.render_pass,
+            capture: dc.capture,
+        })
+    }
+
+    /// The vertices and indices issued between two positions of the same frame, read in place. The indices are
+    /// relative to the draw call they were issued in: when a draw call opened at `from` (a [`QuadGl::batch_break`]
+    /// just before it), they are relative to `from.verts`. None when a submission came in between.
+    pub fn batch_span(&self, from: BatchPosition, to: BatchPosition) -> Option<(&[Vertex], &[u16])> {
+        if from.flushes != self.flushes || to.flushes != self.flushes || from.verts > to.verts || from.indices > to.indices || to.verts > self.batch_vertex_buffer.len() || to.indices > self.batch_index_buffer.len() {
+            return None;
+        }
+        Some((&self.batch_vertex_buffer[from.verts..to.verts], &self.batch_index_buffer[from.indices..to.indices]))
+    }
+
+    /// Draws `indices` of a [`StaticGeometry`] as one draw call in batch order, with the current state (material,
+    /// texture, clip, viewport, model, uniforms, pass), exactly as a geometry call would. No vertices are copied and
+    /// nothing is uploaded: the draw reads the static buffers at submission.
+    pub fn draw_static(&mut self, geometry: &StaticGeometry, indices: std::ops::Range<usize>) {
+        assert!(indices.start <= indices.end && indices.end <= geometry.index_count, "draw_static: indices out of the geometry");
+        if indices.is_empty() {
+            return;
+        }
+        let pip = self.state.pipeline.unwrap_or(self.pipelines.get(self.state.draw_mode, self.state.depth_test_enable));
+        open_draw_call(&self.state, &mut self.pipelines, &mut self.draw_calls, &mut self.draw_calls_count, (self.batch_vertex_buffer.len(), self.batch_index_buffer.len()), pip);
+        let dc = &mut self.draw_calls[self.draw_calls_count - 1];
+        dc.static_src = Some(StaticSource {
+            vertex_buffer: geometry.vertex_buffer,
+            index_buffer: geometry.index_buffer,
+            first_index: indices.start,
+            index_count: indices.len(),
+        });
+        // The next geometry call must not join this draw call.
+        self.state.break_batching = true;
+    }
+
+}
+
+/// Opens the next draw call with the current state, as [`QuadGl::geometry`] does when it starts one. `batch` is the
+/// batch's current end (vertices, indices): the draw call's first vertex and index. Takes the fields it needs, so a
+/// caller may hold a borrow of another field (the transformed vertices of `geometry`).
+fn open_draw_call(state: &GlState, pipelines: &mut PipelinesStorage, draw_calls: &mut Vec<DrawCall>, draw_calls_count: &mut usize, batch: (usize, usize), pip: GlPipeline) {
+    let uniforms = state.pipeline.map_or(None, |pipeline| Some(pipelines.get_quad_pipeline_mut(pipeline).uniforms_data.clone()));
+
+    if *draw_calls_count >= draw_calls.len() {
+        draw_calls.push(DrawCall::new(state.texture, state.model(), state.draw_mode, pip, uniforms.clone(), state.render_pass));
+    }
+    let dc = &mut draw_calls[*draw_calls_count];
+    dc.texture = state.texture;
+    dc.uniforms = uniforms;
+    dc.vertices_count = 0;
+    dc.indices_count = 0;
+    dc.clip = state.clip;
+    dc.viewport = state.viewport;
+    dc.model = state.model();
+    dc.pipeline = pip;
+    dc.render_pass = state.render_pass;
+    dc.capture = state.capture;
+    dc.static_src = None;
+    dc.indices_start = batch.1;
+    dc.vertices_start = batch.0;
+
+    *draw_calls_count += 1;
+}
+
 impl QuadGl {
     pub fn new(
         ctx: &mut dyn miniquad::RenderingBackend,
@@ -780,20 +948,27 @@ impl QuadGl {
 
             self.submit.draws += 1;
             self.submit.bytes += (dc.vertices_count * std::mem::size_of::<Vertex>() + dc.indices_count * std::mem::size_of::<u16>()) as u64;
-            ctx.buffer_update(
-                bindings.vertex_buffers[0],
-                BufferSource::slice(
-                    &self.batch_vertex_buffer
-                        [dc.vertices_start..(dc.vertices_start + dc.vertices_count)],
-                ),
-            );
-            ctx.buffer_update(
-                bindings.index_buffer,
-                BufferSource::slice(
-                    &self.batch_index_buffer
-                        [dc.indices_start..(dc.indices_start + dc.indices_count)],
-                ),
-            );
+            // A retained draw call reads the static geometry's buffers; the pooled stream buffers are put back after it.
+            let stream_buffers = (bindings.vertex_buffers[0], bindings.index_buffer);
+            if let Some(src) = dc.static_src {
+                bindings.vertex_buffers[0] = src.vertex_buffer;
+                bindings.index_buffer = src.index_buffer;
+            } else {
+                ctx.buffer_update(
+                    bindings.vertex_buffers[0],
+                    BufferSource::slice(
+                        &self.batch_vertex_buffer
+                            [dc.vertices_start..(dc.vertices_start + dc.vertices_count)],
+                    ),
+                );
+                ctx.buffer_update(
+                    bindings.index_buffer,
+                    BufferSource::slice(
+                        &self.batch_index_buffer
+                            [dc.indices_start..(dc.indices_start + dc.indices_count)],
+                    ),
+                );
+            }
 
             bindings.images[0] = dc.texture.unwrap_or(white_texture);
             bindings.images[1] = self
@@ -836,8 +1011,14 @@ impl QuadGl {
                 pipeline.uniforms_data.as_ptr(),
                 pipeline.uniforms_data.len(),
             );
-            ctx.draw(0, dc.indices_count as i32, 1);
+            match dc.static_src {
+                // The base element is a byte offset of the index type (u16 here): `first_index` indices into the buffer.
+                Some(src) => ctx.draw(src.first_index as i32, src.index_count as i32, 1),
+                None => ctx.draw(0, dc.indices_count as i32, 1),
+            }
             ctx.end_render_pass();
+            bindings.vertex_buffers[0] = stream_buffers.0;
+            bindings.index_buffer = stream_buffers.1;
 
             if dc.capture {
                 telemetry::track_drawcall(&pipeline.pipeline, bindings, dc.indices_count);
@@ -1043,41 +1224,10 @@ impl QuadGl {
                 || draw_call.vertices_count >= self.max_vertices - vertices.len()
                 || draw_call.indices_count >= self.max_indices - indices.len()
                 || draw_call.capture != self.state.capture
+                || draw_call.static_src.is_some()
                 || self.state.break_batching
         }) {
-            let uniforms = self.state.pipeline.map_or(None, |pipeline| {
-                Some(
-                    self.pipelines
-                        .get_quad_pipeline_mut(pipeline)
-                        .uniforms_data
-                        .clone(),
-                )
-            });
-
-            if self.draw_calls_count >= self.draw_calls.len() {
-                self.draw_calls.push(DrawCall::new(
-                    self.state.texture,
-                    self.state.model(),
-                    self.state.draw_mode,
-                    pip,
-                    uniforms.clone(),
-                    self.state.render_pass,
-                ));
-            }
-            self.draw_calls[self.draw_calls_count].texture = self.state.texture;
-            self.draw_calls[self.draw_calls_count].uniforms = uniforms;
-            self.draw_calls[self.draw_calls_count].vertices_count = 0;
-            self.draw_calls[self.draw_calls_count].indices_count = 0;
-            self.draw_calls[self.draw_calls_count].clip = self.state.clip;
-            self.draw_calls[self.draw_calls_count].viewport = self.state.viewport;
-            self.draw_calls[self.draw_calls_count].model = self.state.model();
-            self.draw_calls[self.draw_calls_count].pipeline = pip;
-            self.draw_calls[self.draw_calls_count].render_pass = self.state.render_pass;
-            self.draw_calls[self.draw_calls_count].capture = self.state.capture;
-            self.draw_calls[self.draw_calls_count].indices_start = self.batch_index_buffer.len();
-            self.draw_calls[self.draw_calls_count].vertices_start = self.batch_vertex_buffer.len();
-
-            self.draw_calls_count += 1;
+            open_draw_call(&self.state, &mut self.pipelines, &mut self.draw_calls, &mut self.draw_calls_count, (self.batch_vertex_buffer.len(), self.batch_index_buffer.len()), pip);
             self.state.break_batching = false;
         };
         let dc = &mut self.draw_calls[self.draw_calls_count - 1];

@@ -45,7 +45,7 @@ use std::pin::Pin;
 
 mod exec;
 mod quad_gl;
-pub use quad_gl::{BatchMark, BatchSave, SubmitStats};
+pub use quad_gl::{BatchMark, BatchPosition, BatchSave, DrawState, StaticGeometry, SubmitStats};
 mod tobytes;
 
 pub mod audio;
