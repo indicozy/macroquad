@@ -395,7 +395,7 @@ struct PipelinesStorage {
 }
 
 impl PipelinesStorage {
-    const MAX_PIPELINES: usize = 32;
+    const MAX_PIPELINES: usize = 128;
     const TRIANGLES_PIPELINE: GlPipeline = GlPipeline(0);
     const LINES_PIPELINE: GlPipeline = GlPipeline(1);
     const TRIANGLES_DEPTH_PIPELINE: GlPipeline = GlPipeline(2);
@@ -427,7 +427,7 @@ impl PipelinesStorage {
         };
 
         let mut storage = PipelinesStorage {
-            pipelines: Default::default(),
+            pipelines: std::array::from_fn(|_| None),
             pipelines_amount: 0,
         };
 
@@ -499,6 +499,14 @@ impl PipelinesStorage {
         mut uniforms: Vec<UniformDesc>,
         textures: Vec<String>,
     ) -> GlPipeline {
+        // Find the free slot before creating the GPU pipeline, so a full table
+        // panics without leaking a pipeline.
+        let id = self
+            .pipelines
+            .iter()
+            .position(|p| p.is_none())
+            .unwrap_or_else(|| panic!("Pipelines amount exceeded"));
+
         let pipeline = ctx.new_pipeline(
             &[BufferLayout::default()],
             &[
@@ -510,12 +518,6 @@ impl PipelinesStorage {
             shader,
             params,
         );
-
-        let id = self
-            .pipelines
-            .iter()
-            .position(|p| p.is_none())
-            .unwrap_or_else(|| panic!("Pipelines amount exceeded"));
 
         let mut max_offset = 0;
 
